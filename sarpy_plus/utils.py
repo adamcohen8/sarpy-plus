@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from sarpy_plus import c, k
-from sarpy_plus import RadarParams
+from sarpy_plus.constants import c, k
+from sarpy_plus.params import RadarParams
 import jax.numpy as jnp
 import jax
 

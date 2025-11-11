@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import jax
-from sarpy_plus import RadarParams, TargetParams, c, k
+from sarpy_plus.params import RadarParams, TargetParams
+from sarpy_plus.constants import  c, k
 
 
 

@@ -17,7 +17,8 @@ def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         verts: (V, 3) np.array of vertices [x, y, z].
         faces: (F, 3) np.array of face indices (0-based).
 
-    Assumes only 'v' and 'f' lines, triangle faces, no textures/normals.
+    Assumes only 'v' and 'f' lines, triangle/quad faces, no textures/normals.
+    Triangulates quads automatically.
     """
     verts = []
     faces = []
@@ -25,18 +26,34 @@ def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         for line in f:
             if line.startswith('v '):
                 parts = line.strip().split()[1:]
-                verts.append([float(p) for p in parts])
+                if len(parts) < 3:
+                    raise ValueError(f"Invalid vertex in {file_path}: {line}")
+                # Take only x y z, ignore r g b or w if present
+                verts.append([float(p) for p in parts[:3]])
             elif line.startswith('f '):
                 parts = line.strip().split()[1:]
-                # Assume 3 verts per face, ignore /tex/norm
+                # Parse indices, ignore /tex/norm
                 face = [int(p.split('/')[0]) - 1 for p in parts]  # 1-based to 0-based
                 if len(face) == 3:
                     faces.append(face)
+                elif len(face) == 4:
+                    # Triangulate quad: split into two tris
+                    faces.append([face[0], face[1], face[2]])
+                    faces.append([face[0], face[2], face[3]])
+                else:
+                    raise ValueError(
+                        f"Unsupported face (not tri/quad) in {file_path}: {line} (triangulate model first)")
 
-    if not verts or not faces:
-        raise ValueError(f"Invalid OBJ: No verts/faces in {file_path}")
+    verts = np.array(verts)
+    faces = np.array(faces)
 
-    return np.array(verts), np.array(faces)
+    if verts.shape[1] != 3:
+        raise ValueError(f"Verts not 3D: shape {verts.shape}")
+
+    if len(faces) == 0:
+        raise ValueError(f"No faces found in {file_path}")
+
+    return verts, faces
 
 
 def compute_triangle_areas(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:

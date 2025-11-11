@@ -1,4 +1,4 @@
-from sarpy_plus import RadarParams
+from sarpy_plus.params import RadarParams
 
 # Range Doppler Algorithm
 

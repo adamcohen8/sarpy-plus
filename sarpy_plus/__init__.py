@@ -27,6 +27,11 @@ from .utils import (plot_space_2d,
                     IRW,
                     ISLR,
                     contiguous_region)
+from .targets import (parse_obj_file,
+                      compute_triangle_areas,
+                      sample_points_on_mesh,
+                      generate_scatterers_from_model,
+                      plot_scatterers_3d)
 
 __all__ = [
     "c",
@@ -59,5 +64,10 @@ __all__ = [
     "PSLR",
     "IRW",
     "ISLR",
-    "contiguous_region"
+    "contiguous_region",
+    "parse_obj_file",
+    "compute_triangle_areas",
+    "sample_points_on_mesh",
+    "generate_scatterers_from_model",
+    "plot_scatterers_3d"
 ]
