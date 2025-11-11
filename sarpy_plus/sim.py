@@ -62,8 +62,10 @@ def SAR_Sim(radar: RadarParams, tgt: TargetParams,
         G_beam_v = jnp.abs(pattern)  # Ensure positive, though typically is in main lobe
     elif radar.antenna_pattern == "gaussian":
         G_beam_v = jnp.exp(- (jnp.log(2) / 2) * (theta / theta_3dB) ** 2)
-    else:  # Default to "sinc"
+    elif radar.antenna_pattern == "sinc": # Default to "sinc"
         G_beam_v = jnp.sqrt((jnp.sinc(theta / theta_3dB)) ** 2)
+    else: #Spotlight Mode
+        G_beam_v = 1.0
 
     # ---------- Voltage-range equation ----------
     sigma_v = jnp.sqrt(10.0 ** (tgt.rcs_dbsm / 10.0))[:, None]   # (Ntgt,1)

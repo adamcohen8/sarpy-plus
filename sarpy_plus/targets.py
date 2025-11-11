@@ -100,7 +100,8 @@ def generate_scatterers_from_model(
         num_centers: int,
         rcs_scale: float = 1.0,
         edge_bias: float = 0.0,
-        edge_rcs_boost: float = 1.0  # Multiplier for edge point amps
+        edge_rcs_boost: float = 1.0,  # Multiplier for edge point amps
+        aspect_angle_deg: float = 0.0  # Aspect angle in degrees (rotation around Z-axis)
 ) -> TargetParams:
     """
     Generate scattering centers from a 3D OBJ model in TargetParams format.
@@ -111,6 +112,7 @@ def generate_scatterers_from_model(
         rcs_scale: Global amplitude/RCS multiplier (in dBsm).
         edge_bias: Fraction of points to sample on edges (0-1).
         edge_rcs_boost: Amplitude boost for edge-sampled points.
+        aspect_angle_deg: Aspect angle in degrees for target rotation (around Z-axis; 0 = original OBJ orientation).
 
     Returns:
         TargetParams instance with positions (3, N), velocities/accelerations as zeros (3, N), rcs_dbsm (N,).
@@ -160,6 +162,18 @@ def generate_scatterers_from_model(
 
     if len(points) != num_centers:
         raise ValueError(f"Generated {len(points)} points, expected {num_centers}")
+
+    # Apply aspect angle rotation (around Z-axis)
+    if aspect_angle_deg != 0:
+        theta = jnp.deg2rad(aspect_angle_deg)
+        cos_theta = jnp.cos(theta)
+        sin_theta = jnp.sin(theta)
+        rot_matrix = jnp.array([
+            [cos_theta, -sin_theta, 0],
+            [sin_theta, cos_theta, 0],
+            [0, 0, 1]
+        ])
+        points = jnp.einsum('ij,kj->ki', rot_matrix, jnp.array(points))  # (N, 3)
 
     # Convert to TargetParams format
     N = num_centers
