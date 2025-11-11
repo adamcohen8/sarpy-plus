@@ -1,0 +1,70 @@
+# Exported from Nomad Sculpt
+
+newmtl Object_6
+ map_Kd Body_baseColor.png
+ map_roughness Body_metallicRoughness_1_roughness.png
+ map_Pr Body_metallicRoughness_1_roughness.png
+ map_metallic Body_metallicRoughness_2_metalness.png
+ map_Pm Body_metallicRoughness_2_metalness.png
+ map_tangentSpaceNormal Body_normal.png
+ map_bump Body_normal.png
+ norm Body_normal.png
+ bump Body_normal.png
+ map_Ke Body_emissive.jpg
+ map_ao Body_metallicRoughness_3.png
+ Kd 1.000000 1.000000 1.000000
+ Ke 1.000000 1.000000 1.000000
+ Pr 0.133098
+ Pm 0.000000
+
+newmtl Object_8
+ map_Kd Eyes_baseColor.png
+ map_roughness Eyes_metallicRoughness_1_roughness.png
+ map_Pr Eyes_metallicRoughness_1_roughness.png
+ map_metallic Eyes_metallicRoughness_2_metalness.png
+ map_Pm Eyes_metallicRoughness_2_metalness.png
+ map_Ke Eyes_emissive.png
+ Kd 1.000000 1.000000 1.000000
+ Ke 1.000000 1.000000 1.000000
+ Pr 0.500000
+ Pm 0.000000
+
+newmtl Object_12
+ Kd 0.020743 0.020743 0.020743
+ Pr 1.000000
+ Pm 1.000000
+
+newmtl Object_13
+ Kd 0.040112 0.040112 0.040112
+ Pr 0.602564
+ Pm 1.000000
+
+newmtl Object_15
+ Kd 0.020743 0.020743 0.020743
+ Pr 1.000000
+ Pm 1.000000
+
+newmtl Object_16
+ Kd 0.040112 0.040112 0.040112
+ Pr 0.602564
+ Pm 1.000000
+
+newmtl Object_18
+ Kd 0.020743 0.020743 0.020743
+ Pr 1.000000
+ Pm 1.000000
+
+newmtl Object_19
+ Kd 0.040112 0.040112 0.040112
+ Pr 0.602564
+ Pm 1.000000
+
+newmtl Object_21
+ Kd 0.020743 0.020743 0.020743
+ Pr 1.000000
+ Pm 1.000000
+
+newmtl Object_22
+ Kd 0.040112 0.040112 0.040112
+ Pr 0.602564
+ Pm 1.000000
