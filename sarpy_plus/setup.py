@@ -12,4 +12,7 @@ setup(
         "matplotlib>=3.5.0",
     ],
     python_requires=">=3.8",
+    install_optional=[
+        "sarpy >= 1.3.61"
+    ],
 )
