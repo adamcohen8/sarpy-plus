@@ -4,6 +4,7 @@ from typing import Tuple
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from typing import Optional
+from sarpy_plus.params import TargetParams
 
 
 def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -17,8 +18,7 @@ def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         verts: (V, 3) np.array of vertices [x, y, z].
         faces: (F, 3) np.array of face indices (0-based).
 
-    Assumes only 'v' and 'f' lines, triangle/quad faces, no textures/normals.
-    Triangulates quads automatically.
+    Assumes only 'v' and 'f' lines, auto-triangulates n-gons, no textures/normals.
     """
     verts = []
     faces = []
@@ -34,15 +34,11 @@ def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
                 parts = line.strip().split()[1:]
                 # Parse indices, ignore /tex/norm
                 face = [int(p.split('/')[0]) - 1 for p in parts]  # 1-based to 0-based
-                if len(face) == 3:
-                    faces.append(face)
-                elif len(face) == 4:
-                    # Triangulate quad: split into two tris
-                    faces.append([face[0], face[1], face[2]])
-                    faces.append([face[0], face[2], face[3]])
-                else:
-                    raise ValueError(
-                        f"Unsupported face (not tri/quad) in {file_path}: {line} (triangulate model first)")
+                if len(face) < 3:
+                    raise ValueError(f"Invalid face (<3 verts) in {file_path}: {line}")
+                # Fan-triangulate if n-gon
+                for i in range(1, len(face) - 1):
+                    faces.append([face[0], face[i], face[i + 1]])
 
     verts = np.array(verts)
     faces = np.array(faces)
@@ -105,19 +101,19 @@ def generate_scatterers_from_model(
         rcs_scale: float = 1.0,
         edge_bias: float = 0.0,
         edge_rcs_boost: float = 1.0  # Multiplier for edge point amps
-) -> jnp.ndarray:
+) -> TargetParams:
     """
-    Generate scattering centers from a 3D OBJ model.
+    Generate scattering centers from a 3D OBJ model in TargetParams format.
 
     Args:
         model_path: Path to .obj file.
         num_centers: Number of scattering centers to sample.
-        rcs_scale: Global amplitude/RCS multiplier.
+        rcs_scale: Global amplitude/RCS multiplier (in dBsm).
         edge_bias: Fraction of points to sample on edges (0-1).
         edge_rcs_boost: Amplitude boost for edge-sampled points.
 
     Returns:
-        scatterers: (N, 4) JAX array [x, y, z, amp]
+        TargetParams instance with positions (3, N), velocities/accelerations as zeros (3, N), rcs_dbsm (N,).
     """
     if not 0 <= edge_bias <= 1:
         raise ValueError("edge_bias must be between 0 and 1")
@@ -165,15 +161,24 @@ def generate_scatterers_from_model(
     if len(points) != num_centers:
         raise ValueError(f"Generated {len(points)} points, expected {num_centers}")
 
-    scatterers = jnp.hstack([jnp.array(points), jnp.array(amps)[:, jnp.newaxis]])
-    return scatterers
+    # Convert to TargetParams format
+    N = num_centers
+    positions = jnp.array(points.T)  # (3, N)
+    velocities = jnp.zeros((3, N))
+    accelerations = jnp.zeros((3, N))
+    rcs_dbsm = jnp.array(amps)  # (N,)
 
-
-
+    return TargetParams(
+        positions_m=positions,
+        velocities_mps=velocities,
+        accelerations_mps2=accelerations,
+        rcs_dbsm=rcs_dbsm,
+        phase_rad=None
+    )
 
 
 def plot_scatterers_3d(
-        scatterers: jnp.ndarray,
+        target: TargetParams,
         cmap: str = 'viridis',
         marker_size: float = 20.0,
         title: str = '3D Scattering Centers',
@@ -183,7 +188,7 @@ def plot_scatterers_3d(
     Plot scattering centers in 3D, colored by amplitude.
 
     Args:
-        scatterers: (N, 4) JAX/NumPy array [x, y, z, amp].
+        target: TargetParams instance with positions (3, N) and rcs_dbsm (N,).
         cmap: Colormap for amplitude (e.g., 'viridis', 'plasma').
         marker_size: Size of scatter points.
         title: Plot title.
@@ -191,23 +196,26 @@ def plot_scatterers_3d(
 
     Example:
         from sarpy_plus.targets import generate_scatterers_from_model
-        scatterers = generate_scatterers_from_model('path/to/model.obj', 500)
-        plot_scatterers_3d(scatterers)
+        target = generate_scatterers_from_model('path/to/model.obj', 500)
+        plot_scatterers_3d(target)
     """
-    # Convert to NumPy if JAX
-    scatterers = jnp.asarray(scatterers)
+    # Extract positions and amps
+    positions = jnp.asarray(target.positions_m.T)  # (N, 3)
+    amps = jnp.asarray(target.rcs_dbsm)  # (N,)
 
-    if scatterers.shape[1] != 4:
-        raise ValueError("Scatterers must be (N, 4) array: [x, y, z, amp]")
+    if positions.shape[1] != 3:
+        raise ValueError("Positions must be (N, 3)")
+    if len(amps) != len(positions):
+        raise ValueError("Amps length must match number of positions")
 
-    x, y, z, amp = scatterers.T
+    x, y, z = positions.T
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
 
     scatter = ax.scatter(
         x, y, z,
-        c=amp,
+        c=amps,
         cmap=cmap,
         s=marker_size,
         alpha=0.8
@@ -216,12 +224,12 @@ def plot_scatterers_3d(
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title(title)
     ax.view_init(elev=20, azim=-60)
+    ax.set_title(title)
 
     # Add colorbar for amplitude
     cbar = fig.colorbar(scatter, ax=ax, shrink=0.5, aspect=5)
-    cbar.set_label('Amplitude / RCS')
+    cbar.set_label('Amplitude / RCS (dBsm)')
 
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
