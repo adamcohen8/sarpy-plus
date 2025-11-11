@@ -1,7 +1,7 @@
 # params.py
 from dataclasses import dataclass, field
 import jax.numpy as jnp
-from SARpy.constants import c, k
+from sarpy_plus import c, k
 
 
 @dataclass(frozen=True)

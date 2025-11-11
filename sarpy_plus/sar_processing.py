@@ -1,9 +1,8 @@
-from SARpy.params import RadarParams
+from sarpy_plus import RadarParams, c, nextpow2, integer_sequence
 import numpy as np
 import jax.numpy as jnp
 from jax.numpy.fft import fft, ifft, fftshift, fftfreq, ifftshift, fft2, ifft2
-from SARpy.constants import c
-from SARpy.utils import nextpow2, integer_sequence
+
 
 def crop_ph(ph: np.ndarray,
             radar: RadarParams,
