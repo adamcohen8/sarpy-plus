@@ -103,7 +103,8 @@ def generate_scatterers_from_model(
         model_path: str,
         num_centers: int,
         rcs_scale: float = 1.0,
-        edge_bias: float = 0.0  # Future: Fraction of points biased to edges (0-1)
+        edge_bias: float = 0.0,
+        edge_rcs_boost: float = 1.0  # Multiplier for edge point amps
 ) -> jnp.ndarray:
     """
     Generate scattering centers from a 3D OBJ model.
@@ -112,19 +113,57 @@ def generate_scatterers_from_model(
         model_path: Path to .obj file.
         num_centers: Number of scattering centers to sample.
         rcs_scale: Global amplitude/RCS multiplier.
-        edge_bias: (Stub) Fraction to place on edges (impl later).
+        edge_bias: Fraction of points to sample on edges (0-1).
+        edge_rcs_boost: Amplitude boost for edge-sampled points.
 
     Returns:
         scatterers: (N, 4) JAX array [x, y, z, amp]
     """
-    if edge_bias > 0:
-        raise NotImplementedError("Edge bias sampling coming in v0.5")
+    if not 0 <= edge_bias <= 1:
+        raise ValueError("edge_bias must be between 0 and 1")
 
     verts, faces = parse_obj_file(model_path)
-    points = sample_points_on_mesh(verts, faces, num_centers)
 
-    # Assign uniform amplitude for now (edge RCS boosts later)
-    amps = np.full(num_centers, rcs_scale)
+    num_edge = int(num_centers * edge_bias)
+    num_surf = num_centers - num_edge
+
+    # Surface points (if any)
+    surf_points = np.empty((0, 3)) if num_surf == 0 else sample_points_on_mesh(verts, faces, num_surf)
+    surf_amps = np.full(len(surf_points), rcs_scale)
+
+    # Edge points (if any)
+    edge_points = np.empty((0, 3))
+    if num_edge > 0:
+        # Get unique edges (undirected)
+        edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        edges = np.sort(edges, axis=1)  # Sort for uniqueness
+        edges = np.unique(edges, axis=0)  # (E, 2) unique edges
+
+        # Edge lengths for weighting
+        va = verts[edges[:, 0]]
+        vb = verts[edges[:, 1]]
+        lengths = np.linalg.norm(vb - va, axis=1)
+        if np.sum(lengths) == 0:
+            raise ValueError("Mesh has zero-length edges")
+        probs = lengths / np.sum(lengths)
+
+        # Choose edges
+        chosen_edges = np.random.choice(len(edges), size=num_edge, p=probs)
+
+        # Sample points along chosen edges
+        t = np.random.rand(num_edge)  # [0,1] lerp factor
+        va = verts[edges[chosen_edges, 0]]
+        vb = verts[edges[chosen_edges, 1]]
+        edge_points = va + t[:, np.newaxis] * (vb - va)
+
+    edge_amps = np.full(len(edge_points), rcs_scale * edge_rcs_boost)
+
+    # Combine
+    points = np.vstack([surf_points, edge_points])
+    amps = np.hstack([surf_amps, edge_amps])
+
+    if len(points) != num_centers:
+        raise ValueError(f"Generated {len(points)} points, expected {num_centers}")
 
     scatterers = jnp.hstack([jnp.array(points), jnp.array(amps)[:, jnp.newaxis]])
     return scatterers
@@ -178,6 +217,7 @@ def plot_scatterers_3d(
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
     ax.set_title(title)
+    ax.view_init(elev=20, azim=-60)
 
     # Add colorbar for amplitude
     cbar = fig.colorbar(scatter, ax=ax, shrink=0.5, aspect=5)
