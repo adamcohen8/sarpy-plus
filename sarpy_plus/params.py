@@ -1,5 +1,6 @@
 # params.py
 from dataclasses import dataclass, field
+from typing import Literal
 import jax.numpy as jnp
 from sarpy_plus import c, k
 
@@ -27,6 +28,7 @@ class RadarParams:
     SNR_SAR: float = None
     noise: bool = True
     antenna_pattern: str = "sinc"
+    demodulation: Literal['Quadrature', 'Dechirp'] = 'Quadrature'
 
 
     # Derived

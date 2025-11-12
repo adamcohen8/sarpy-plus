@@ -80,11 +80,21 @@ def SAR_Sim(radar: RadarParams, tgt: TargetParams,
     # ---------- Fast-time envelope ----------
     tau  = 2.0 * R / c
     tcen = t_fast[:, None, None] - tau[None, :, :]
-    mask = jnp.abs(tcen) < radar.pulse_width_sec / 2.0
+
+    if radar.demodulation == 'Dechirp':
+        tau_ref = 2.0 * radar.range_grp_m / c
+        # For dechirp, use fixed mask centered on reference (approximation)
+        mask = jnp.abs(t_fast[:, None, None] - tau_ref) < radar.pulse_width_sec / 2.0
+        # Dechirp phase (conjugate of reference chirp)
+        tcen_ref = t_fast[:, None, None] - tau_ref
+        dechirp_p = -jnp.pi * radar.chirp_rate_hz_per_sec * tcen_ref ** 2
+    else:  # 'Quadrature'
+        mask = jnp.abs(tcen) < radar.pulse_width_sec / 2.0
+        dechirp_p = 0.0  # No dechirp
 
     p1 = -4.0 * jnp.pi * R                # 2-way phase (divide by λ later)
     p2 = jnp.pi * radar.chirp_rate_hz_per_sec * tcen ** 2
-    total_phase = (p1 / lam) + phase0[:, None] + p2           # (Nr,Ntgt,Np)
+    total_phase = (p1 / lam) + phase0[:, None] + p2 + dechirp_p           # (Nr,Ntgt,Np)
 
     target_v = A_R[None, :, :] * jnp.exp(1j * total_phase) * mask.astype(jnp.float32)
     ph = jnp.sum(target_v, axis=1)                            # (Nr, Np)

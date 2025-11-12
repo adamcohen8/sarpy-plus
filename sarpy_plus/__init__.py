@@ -32,7 +32,8 @@ from .targets import (parse_obj_file,
                       sample_points_on_mesh,
                       generate_scatterers_from_model,
                       plot_scatterers_3d)
-from .ifp import (rda)
+from .ifp import (rda,
+                  wka)
 
 __all__ = [
     "c",
@@ -71,5 +72,6 @@ __all__ = [
     "sample_points_on_mesh",
     "generate_scatterers_from_model",
     "plot_scatterers_3d",
-    "rda"
+    "rda",
+    "wka"
 ]
