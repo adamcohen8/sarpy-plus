@@ -1,4 +1,4 @@
-from sarpy_plus.targets import generate_scatterers_from_model, plot_scatterers_3d
+from sarpy_plus.targets import plot_scatterers_3d, generate_scatterers_from_model
 from sarpy_plus import (RadarParams,
                         TargetParams,
                         SAR_Sim,
@@ -8,8 +8,24 @@ from sarpy_plus import (RadarParams,
                         wka)
 
 # Generate from model
-target = generate_scatterers_from_model('Cybertruck.obj', num_centers=500, rcs_scale=20.0, edge_bias=1.0, edge_rcs_boost=1.5, aspect_angle_deg=90.0)  # dB edges
 
+target = generate_scatterers_from_model(
+    "Cybertruck.obj",
+    num_centers=256,
+    orient="auto",               # ← auto-detect up = Z, length = Y
+    subdivide_levels=2,
+    edge_fraction=0.60,
+    corner_fraction=0.08,
+    min_per_face=3,
+    surface_edge_hug_frac=0.55,
+    hard_edge_threshold_deg=6.0,
+    silhouette_boost_frac=0.45,
+    silhouette_bound_eps=0.06,
+    jitter_tangent=0.0010,
+    octant_floor_surface_frac=0.06,
+    octant_floor_edge_frac=0.06,
+    random_seed=17
+)
 
 
 plot_scatterers_3d(target)
@@ -26,7 +42,7 @@ radar = RadarParams(
     ground_range_swath_m=100.0,
     range_grp_m=500.0,
     azimuth_aperture_factor=1.0,
-    SNR_SAR=-10.0,
+    SNR_SAR=50.0,
     antenna_pattern="spotlight",
     noise=True
 )
@@ -36,6 +52,6 @@ ph = SAR_Sim(radar, target)
 
 plot_time_2d(ph, radar)
 
-image = wka(ph, radar)
+image = rda(ph, radar)
 
-plot_space_2d(image, radar)
+plot_space_2d(image, radar,window=8)

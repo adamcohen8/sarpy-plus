@@ -1,13 +1,18 @@
-import jax.numpy as jnp
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from typing import Optional
-from sarpy_plus.params import TargetParams
+
+# ------------------------------------------------------------
+# Scatterer generator: "polkadot skin"
+#   • orientation (auto/manual)
+#   • optional subdivision (mid-edge)
+#   • silhouette edge boost (view-independent)
+#   • octant balancing (avoids “half missing”)
+#   • edge-hugging surface dots, min-per-face, tiny jitter
+# ------------------------------------------------------------
+
 from typing import Tuple, Optional
-
-
-
+import numpy as np
+import jax.numpy as jnp
+from sarpy_plus.params import TargetParams
+from sarpy_plus.targets import plot_scatterers_3d
 
 
 
@@ -457,62 +462,26 @@ def generate_scatterers_from_model(
     )
 
 
-def plot_scatterers_3d(
-        target: TargetParams,
-        cmap: str = 'viridis',
-        marker_size: float = 20.0,
-        title: str = '3D Scattering Centers',
-        save_path: Optional[str] = None
-) -> None:
-    """
-    Plot scattering centers in 3D, colored by amplitude.
 
-    Args:
-        target: TargetParams instance with positions (3, N) and rcs_dbsm (N,).
-        cmap: Colormap for amplitude (e.g., 'viridis', 'plasma').
-        marker_size: Size of scatter points.
-        title: Plot title.
-        save_path: Optional file path to save the figure (e.g., 'scatter.png').
+target = generate_scatterers_from_model(
+    "Cybertruck.obj",
+    num_centers=512,
+    orient="auto",               # ← auto-detect up = Z, length = Y
+    subdivide_levels=2,
+    edge_fraction=0.60,
+    corner_fraction=0.08,
+    min_per_face=3,
+    surface_edge_hug_frac=0.55,
+    hard_edge_threshold_deg=6.0,
+    silhouette_boost_frac=0.45,
+    silhouette_bound_eps=0.06,
+    jitter_tangent=0.0010,
+    octant_floor_surface_frac=0.06,
+    octant_floor_edge_frac=0.06,
+    random_seed=17
+)
 
-    Example:
-        from sarpy_plus.targets import generate_scatterers_from_model
-        target = generate_scatterers_from_model('path/to/model.obj', 500)
-        plot_scatterers_3d(target)
-    """
-    # Extract positions and amps
-    positions = jnp.asarray(target.positions_m.T)  # (N, 3)
-    amps = jnp.asarray(target.rcs_dbsm)  # (N,)
 
-    if positions.shape[1] != 3:
-        raise ValueError("Positions must be (N, 3)")
-    if len(amps) != len(positions):
-        raise ValueError("Amps length must match number of positions")
 
-    x, y, z = positions.T
+plot_scatterers_3d(target)
 
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    scatter = ax.scatter(
-        x, y, z,
-        c=amps,
-        cmap=cmap,
-        s=marker_size,
-        alpha=0.8
-    )
-
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.view_init(elev=0, azim=0)
-    ax.set_title(title)
-
-    # Add colorbar for amplitude
-    cbar = fig.colorbar(scatter, ax=ax, shrink=0.5, aspect=5)
-    cbar.set_label('Amplitude / RCS (dBsm)')
-
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved to {save_path}")
-
-    plt.show()
