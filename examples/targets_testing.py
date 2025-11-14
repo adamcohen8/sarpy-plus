@@ -9,13 +9,13 @@ from sarpy_plus import (RadarParams,
 
 # Generate from model
 
-target = generate_scatterers_from_model(
+target, bvh, meta = generate_scatterers_from_model(
     "Cybertruck.obj",
     num_centers=256,
     orient="auto",               # ← auto-detect up = Z, length = Y
-    subdivide_levels=2,
-    edge_fraction=0.60,
-    corner_fraction=0.08,
+    subdivide_levels=3,
+    edge_fraction=0.50,
+    corner_fraction=0.10,
     min_per_face=3,
     surface_edge_hug_frac=0.55,
     hard_edge_threshold_deg=6.0,
@@ -31,27 +31,28 @@ target = generate_scatterers_from_model(
 plot_scatterers_3d(target)
 
 radar = RadarParams(
-    platform_altitude_m=200.0,
+    platform_altitude_m=500.0,
     platform_speed_mps=100.0,
-    center_frequency_hz=10e9,
-    range_resolution_m=0.25,
-    cross_range_resolution_m=0.25,
+    center_frequency_hz=15e9,
+    range_resolution_m=0.1,
+    cross_range_resolution_m=0.1,
     pulse_width_sec=0.25e-6,
-    prf_hz=5000.0,
-    range_oversample=4.0,
+    prf_hz=3000.0,
+    range_oversample=2.0,
     ground_range_swath_m=100.0,
     range_grp_m=500.0,
     azimuth_aperture_factor=1.0,
     SNR_SAR=50.0,
     antenna_pattern="spotlight",
-    noise=True
+    noise=False
 )
 
 
-ph = SAR_Sim(radar, target)
+ph = SAR_Sim(radar, target, bvh=bvh, meta=meta)
 
 plot_time_2d(ph, radar)
 
 image = rda(ph, radar)
 
-plot_space_2d(image, radar,window=8)
+plot_space_2d(image, radar, window=8)
+plot_space_2d(image, radar, window=8, db=True)

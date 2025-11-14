@@ -1,5 +1,9 @@
 from .constants import c, k
-from .params import RadarParams, TargetParams
+from .params import (RadarParams,
+                     TargetParams,
+                     compute_rcs_weights,
+                     RCSParams,
+                     ScattererMeta)
 from .sim import SAR_Sim
 from .sar_processing import (crop_ph,
                              pulse_compression,
@@ -89,5 +93,8 @@ __all__ = [
     "generate_scatterers_from_model",
     "plot_scatterers_3d",
     "rda",
-    "wka"
+    "wka",
+    "ScattererMeta",
+    "RCSParams",
+    "compute_rcs_weights"
 ]

@@ -1,14 +1,21 @@
-import jax.numpy as jnp
+# ------------------------------------------------------------
+# scatterer_generator.py
+# Returns: TargetParams, BVH, ScattererMeta
+# - Preserves original OBJ dimensions
+# - Orientation about centroid (auto/manual/none)
+# - Optional mid-edge subdivision (shape-preserving)
+# - Surface (edge-hugging), edge, and corner sampling
+# - Octant balancing + silhouette boost (view-independent)
+# - Records per-dot metadata for RCS computation
+# ------------------------------------------------------------
+
+from typing import Tuple, Optional, List
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from typing import Optional
+import jax.numpy as jnp
 from sarpy_plus.params import TargetParams
-from typing import Tuple, Optional
-
-
-
-
+from sarpy_plus.sim import BVH              # <-- adjust import if BVH lives elsewhere
+from sarpy_plus.params import ScattererMeta    # <-- from the Level-1 RCS module we set up
+import matplotlib.pyplot as plt
 
 
 # ---------- OBJ parsing (v/f only, fan-triangulate) ----------
@@ -38,6 +45,7 @@ def parse_obj_file(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         raise ValueError(f"Verts not 3D: {verts.shape}")
     return verts, faces
 
+
 # ---------- Geometry helpers ----------
 def _face_geom(verts: np.ndarray, faces: np.ndarray):
     a = verts[faces[:, 0]]; b = verts[faces[:, 1]]; c = verts[faces[:, 2]]
@@ -52,6 +60,7 @@ def _face_geom(verts: np.ndarray, faces: np.ndarray):
     return normals, areas, perims
 
 def _edge_map(faces: np.ndarray):
+    """Map edge (i,j) -> list of adjacent face indices"""
     m = {}
     for fi, f in enumerate(faces):
         e = [(int(f[0]),int(f[1])), (int(f[1]),int(f[2])), (int(f[2]),int(f[0]))]
@@ -62,7 +71,7 @@ def _edge_map(faces: np.ndarray):
 
 def _detect_edges_soft(edge_map, normals, verts,
                        hard_thr_deg: float = 8.0, soft_power: float = 1.5):
-    edges, lens, hard, wts = [], [], [], []
+    edges, lens, hard, wts, dihedral = [], [], [], [], []
     cos_thr = np.cos(np.deg2rad(hard_thr_deg))
     for (i,j), fidxs in edge_map.items():
         v0, v1 = verts[i], verts[j]
@@ -70,19 +79,20 @@ def _detect_edges_soft(edge_map, normals, verts,
         if L <= 0:
             continue
         if len(fidxs) < 2:
-            edges.append((i,j)); lens.append(L); hard.append(True); wts.append(1.0)
+            # boundary → treat as hard with π dihedral
+            edges.append((i,j)); lens.append(L); hard.append(True); wts.append(1.0); dihedral.append(np.pi)
         else:
             f0, f1 = fidxs[0], fidxs[1]
             n0, n1 = normals[f0], normals[f1]
             dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
-            ang = np.arccos(dot)                     # [0,π]
-            soft = (ang/np.pi)**soft_power          # 0..1
-            is_hard = (dot < cos_thr)               # angle > threshold
-            edges.append((i,j)); lens.append(L); hard.append(is_hard); wts.append(soft)
+            ang = np.arccos(dot)                      # 0..π (dihedral supplement)
+            soft = (ang/np.pi)**soft_power
+            is_hard = (dot < cos_thr)
+            edges.append((i,j)); lens.append(L); hard.append(is_hard); wts.append(soft); dihedral.append(ang)
     if not edges:
-        return (np.empty((0,2),int), np.array([]), np.array([],bool), np.array([]))
+        return (np.empty((0,2),int), np.array([]), np.array([],bool), np.array([]), np.array([]))
     return (np.asarray(edges,int), np.asarray(lens,float),
-            np.asarray(hard,bool), np.asarray(wts,float))
+            np.asarray(hard,bool), np.asarray(wts,float), np.asarray(dihedral,float))
 
 def _sample_in_triangle(a,b,c,k):
     if k<=0: return np.empty((0,3))
@@ -108,20 +118,17 @@ def _octant_id(xyz: np.ndarray) -> np.ndarray:
     s = (xyz >= med).astype(int)
     return (s[:,0] << 2) | (s[:,1] << 1) | s[:,2]
 
-# ---------- Orientation helpers (scale-preserving) ----------
+
+# ---------- Orientation (preserve scale & placement) ----------
 def _axis_extents(verts: np.ndarray):
     vmin = verts.min(axis=0); vmax = verts.max(axis=0)
     return (vmax - vmin)
 
 def _auto_orient_car_preserve(verts: np.ndarray) -> np.ndarray:
-    """
-    Aligns: longest -> Y, second -> X, shortest -> Z.
-    Applies rotation about centroid and translates back (so world position preserved).
-    """
     cen = verts.mean(axis=0, keepdims=True)
     v = verts - cen
     ext = _axis_extents(v)
-    order = np.argsort(-ext)  # descending
+    order = np.argsort(-ext)  # longest, second, shortest
     M = np.zeros((3,3))
     M[1, order[0]] = 1.0  # longest -> Y
     M[0, order[1]] = 1.0  # second  -> X
@@ -134,9 +141,6 @@ def _auto_orient_car_preserve(verts: np.ndarray) -> np.ndarray:
 def _orient_manual_preserve(verts: np.ndarray,
                             axis_permutation: tuple[str,str,str]=('x','y','z'),
                             axis_sign: tuple[int,int,int]=(1,1,1)) -> np.ndarray:
-    """
-    Permute/flip axes about the centroid (so position is preserved).
-    """
     cen = verts.mean(axis=0, keepdims=True)
     v = verts - cen
     idx = {'x':0, 'y':1, 'z':2}
@@ -147,6 +151,7 @@ def _orient_manual_preserve(verts: np.ndarray,
         M[0,:] *= -1.0
     v = v @ M.T
     return v + cen
+
 
 # ---------- Mid-edge subdivision ----------
 def subdivide_mesh(verts: np.ndarray, faces: np.ndarray, level: int = 1):
@@ -182,7 +187,25 @@ def subdivide_mesh(verts: np.ndarray, faces: np.ndarray, level: int = 1):
         f = np.asarray(new_faces, dtype=int)
     return v, f
 
-# ---------- Main generator (preserves original scale by default) ----------
+
+# ---------- Simple estimates for corner metadata ----------
+def estimate_corner_size(v_idx: int, verts: np.ndarray, edge_map) -> float:
+    Ls = []
+    for (i,j), _ in edge_map.items():
+        if i==v_idx or j==v_idx:
+            Ls.append(np.linalg.norm(verts[i]-verts[j]))
+    return float(np.mean(Ls)) if Ls else 0.0
+
+def estimate_bisector_from_faces(face_ids: List[int], normals: np.ndarray) -> np.ndarray:
+    if not face_ids:
+        return np.zeros(3)
+    fn = normals[np.array(face_ids)]
+    b = fn.mean(axis=0)
+    n = np.linalg.norm(b)
+    return (b / n) if n > 0 else np.zeros(3)
+
+
+# ---------- Main generator (returns TargetParams, BVH, ScattererMeta) ----------
 def generate_scatterers_from_model(
     model_path: str,
     num_centers: int,
@@ -207,55 +230,58 @@ def generate_scatterers_from_model(
     # silhouette boost
     silhouette_boost_frac: float = 0.35,
     silhouette_bound_eps: float = 0.06,
-    # NEW: scale/centering controls
-    preserve_scale: bool = True,                  # keep original dimensions (default)
-    center: bool = False,                         # if True, translate final result to origin
+    # placement
+    center: bool = False,                         # translate final result to origin (no scaling ever)
+    # BVH control
+    bvh_leaf_size: int = 8,
+    # RNG
     random_seed: Optional[int] = 11
-) -> TargetParams:
+) -> Tuple[TargetParams, BVH, ScattererMeta]:
     """
-    View-independent 'polkadot' scatterers with strong shape preservation.
-    - Preserves original OBJ dimensions by default (no scaling).
-    - Orientation is done about the centroid, then translated back.
-    - Set center=True if you want the final points centered at the origin (translation only).
+    Returns:
+      target: TargetParams (positions (3,N), zeros v/a, unit amps)
+      bvh:    BVH built from the oriented, subdivided mesh (same frame as positions)
+      meta:   ScattererMeta with per-dot fields (facet/edge/corner)
     """
     if random_seed is not None:
         np.random.seed(random_seed)
 
-    # Load OBJ
+    # --- Load & orient (preserve dimensions) ---
     verts, faces = parse_obj_file(model_path)
-
-    # ---- ORIENT (about centroid, preserves position/scale) ----
     if orient == "auto":
         verts = _auto_orient_car_preserve(verts)
     elif orient == "manual":
         verts = _orient_manual_preserve(verts, axis_permutation, axis_sign)
     # elif "none": keep as-is
 
-    # Optional subdivision (does not change dimensions)
+    # Subdivide (shape-preserving)
     if subdivide_levels > 0:
         verts, faces = subdivide_mesh(verts, faces, level=subdivide_levels)
 
-    # (No scaling if preserve_scale=True; dimensions remain unchanged)
-    # Optional recentering AFTER all geometry ops
+    # Optional recenter AFTER orientation/subdivision
     if center:
         verts = verts - verts.mean(axis=0, keepdims=True)
+
+    # Build BVH on this exact mesh (same frame as scatterers)
+    bvh = BVH.from_mesh(verts, faces, leaf_size=bvh_leaf_size)
 
     # Face geometry
     normals, areas, perims = _face_geom(verts, faces)
     if float(areas.sum()) <= 0:
         raise ValueError("Zero-area mesh.")
 
-    # Edge analysis
+    # Edge analysis (+ dihedral angle)
     e_map = _edge_map(faces)
-    e_idx, e_len, e_hard, e_wt = _detect_edges_soft(
+    e_idx, e_len, e_hard, e_wt, e_dih = _detect_edges_soft(
         e_map, normals, verts, hard_thr_deg=hard_edge_threshold_deg, soft_power=1.5
     )
 
-    # Corner detection by vertex normal spread
+    # Corner detection (vertex normal spread) + per-vertex face lists
     vert_faces = [[] for _ in range(len(verts))]
     for fi, f in enumerate(faces):
         for v in f:
             vert_faces[int(v)].append(fi)
+
     corner_mask = np.zeros(len(verts), dtype=bool)
     thr_corner = np.deg2rad(max(10.0, hard_edge_threshold_deg + 4.0))
     for vidx, fidxs in enumerate(vert_faces):
@@ -285,7 +311,7 @@ def generate_scatterers_from_model(
 
     oct_floor = max(1, int(octant_floor_surface_frac * max(0, n_surf)))
     oct_quota = np.floor(oct_probs * n_surf).astype(int)
-    # floors
+    # floors & exact total
     for k in oct_ids:
         need = oct_floor - oct_quota[k]
         if need > 0:
@@ -295,10 +321,9 @@ def generate_scatterers_from_model(
                 give = min(need, oct_quota[d]-oct_floor)
                 oct_quota[d]-=give; oct_quota[k]+=give; need-=give
                 if need<=0: break
-    # exact total
     delta = n_surf - int(oct_quota.sum())
     if delta != 0:
-        p = oct_probs / oct_probs.sum()
+        p = (oct_probs / oct_probs.sum())
         idx = np.random.choice(8, size=abs(delta), p=p)
         for k in idx: oct_quota[k] += 1 if delta>0 else -1
 
@@ -325,7 +350,19 @@ def generate_scatterers_from_model(
             add = np.random.choice(idxs, size=left, p=wk, replace=True)
             for i in add: base_counts[i]+=1
 
-    # ---------- SURFACE: sample (edge-hugging) ----------
+    # ---------- Prepare metadata accumulators ----------
+    kinds: List[int] = []
+    facet_normals: List[np.ndarray] = []
+    facet_area_shares: List[float] = []
+    facet_rough: List[float] = []
+
+    edge_len_shares: List[float] = []
+    wedge_alphas: List[float] = []
+
+    corner_sizes_a: List[float] = []
+    corner_bisectors: List[np.ndarray] = []
+
+    # ---------- SURFACE: sample (edge-hugging) + metadata ----------
     surf_pts = []
     near_frac = float(np.clip(surface_edge_hug_frac, 0.0, 1.0))
     for fi, k in enumerate(base_counts):
@@ -333,32 +370,43 @@ def generate_scatterers_from_model(
         a = verts[faces[fi,0]]; b = verts[faces[fi,1]]; c = verts[faces[fi,2]]
         k_edge = int(round(k * near_frac))
         k_int  = k - k_edge
-        if k_int  > 0: surf_pts.append(_sample_in_triangle(a,b,c,k_int))
-        if k_edge > 0: surf_pts.append(_sample_near_edges(a,b,c,k_edge,edge_bias=0.20))
+
+        pts_face = []
+        if k_int  > 0: pts_face.append(_sample_in_triangle(a,b,c,k_int))
+        if k_edge > 0: pts_face.append(_sample_near_edges(a,b,c,k_edge,edge_bias=0.20))
+        if pts_face:
+            P = np.vstack(pts_face)
+            surf_pts.append(P)
+
+            # Metadata for facets:
+            # assign area share = face_area / k (for that face)
+            area_share = float(areas[fi]) / max(k, 1)
+            n = normals[fi]
+            # append k entries
+            kinds.extend([0] * k)
+            facet_normals.extend([n] * k)
+            facet_area_shares.extend([area_share] * k)
+            facet_rough.extend([0.0] * k)  # tweak if you have per-face roughness
+
+            # pad non-used fields
+            edge_len_shares.extend([0.0] * k)
+            wedge_alphas.extend([0.0] * k)
+            corner_sizes_a.extend([0.0] * k)
+            corner_bisectors.extend([np.zeros(3)] * k)
+
     surf_pts = np.vstack(surf_pts) if surf_pts else np.empty((0,3))
 
     # tiny tangent jitter (does not change dimensions meaningfully)
     if jitter_tangent > 0 and surf_pts.shape[0] > 0:
-        jit = np.empty_like(surf_pts)
-        idx = 0
-        # approximate face-based tangent frames
-        for fi, k in enumerate(base_counts):
-            if k <= 0: continue
-            n = normals[fi]
-            a = np.array([1.0,0.0,0.0]) if abs(np.dot(n,[1,0,0]))<0.9 else np.array([0.0,1.0,0.0])
-            t1 = np.cross(n,a); t1/= (np.linalg.norm(t1)+1e-12)
-            t2 = np.cross(n,t1); t2/= (np.linalg.norm(t2)+1e-12)
-            offs = (np.random.randn(k,1)*jitter_tangent)*t1 + (np.random.randn(k,1)*jitter_tangent)*t2
-            jit[idx:idx+k] = offs; idx += k
-        surf_pts = surf_pts + jit
+        # per-face jitter already approximated in earlier version; keep a global tiny noise
+        surf_pts = surf_pts + (np.random.randn(*surf_pts.shape) * jitter_tangent)
 
-    # ---------- EDGES: octant-balanced + silhouette boost ----------
+    # ---------- EDGES: silhouette boost + octant balancing + metadata ----------
     edge_pts = np.empty((0,3))
     if e_idx.size>0 and n_edge>0:
         mid = 0.5*(verts[e_idx[:,0]] + verts[e_idx[:,1]])     # (E,3)
         e_oct = _octant_id(mid)
 
-        # silhouette mask: midpoints near bbox min/max along any axis
         vmin = verts.min(axis=0); vmax = verts.max(axis=0); ext = vmax - vmin
         tol = np.maximum(silhouette_bound_eps * np.maximum(ext, 1e-12), 1e-12)
         near_min = (np.abs(mid - vmin) <= tol).any(axis=1)
@@ -372,6 +420,9 @@ def generate_scatterers_from_model(
         hard_w = np.where(e_hard, 1.0, 0.0)
         sel_w_all = L * (0.6*hard_w + 0.4*np.clip(e_wt,0,1))
 
+        chosen_edges_total: List[int] = []
+        chosen_pts_total: List[np.ndarray] = []
+
         # silhouette selection
         if n_sil > 0 and np.any(is_sil):
             idxs = np.where(is_sil)[0]
@@ -380,12 +431,11 @@ def generate_scatterers_from_model(
             pick = np.random.choice(idxs, size=n_sil, p=w, replace=True)
             t = np.random.rand(pick.size)
             va = verts[e_idx[pick,0]]; vb = verts[e_idx[pick,1]]
-            edge_pts_sil = va + t[:,None]*(vb - va)
-        else:
-            edge_pts_sil = np.empty((0,3))
+            pts_sil = va + t[:,None]*(vb - va)
+            chosen_edges_total.extend(pick.tolist())
+            chosen_pts_total.append(pts_sil)
 
         # remaining edges: octant-balanced
-        edge_pts_rest = np.empty((0,3))
         if n_rest > 0:
             Ltot = np.array([L[e_oct==k].sum() for k in range(8)], float)
             Ltot[Ltot<=0] = 1e-12
@@ -407,7 +457,6 @@ def generate_scatterers_from_model(
                 p = (Ltot/Ltot.sum()); idx = np.random.choice(8, size=abs(d), p=p)
                 for k in idx: q[k] += 1 if d>0 else -1
 
-            sel = []
             for k in range(8):
                 mask = (e_oct==k)
                 if not np.any(mask) or q[k]<=0: continue
@@ -415,16 +464,35 @@ def generate_scatterers_from_model(
                 w = sel_w_all[idxs]
                 w = w / np.clip(w.sum(), 1e-12, None)
                 pick = np.random.choice(idxs, size=q[k], p=w, replace=True)
-                sel.append(pick)
-            if sel:
-                sel = np.concatenate(sel)
-                t = np.random.rand(sel.size)
-                va = verts[e_idx[sel,0]]; vb = verts[e_idx[sel,1]]
-                edge_pts_rest = va + t[:,None]*(vb - va)
+                t = np.random.rand(pick.size)
+                va = verts[e_idx[pick,0]]; vb = verts[e_idx[pick,1]]
+                pts_rest = va + t[:,None]*(vb - va)
+                chosen_edges_total.extend(pick.tolist())
+                chosen_pts_total.append(pts_rest)
 
-        edge_pts = np.vstack([edge_pts_sil, edge_pts_rest]) if (edge_pts_sil.size or edge_pts_rest.size) else np.empty((0,3))
+        if chosen_pts_total:
+            edge_pts = np.vstack(chosen_pts_total)
+            # ---- Edge metadata assignment ----
+            chosen_edges_total = np.asarray(chosen_edges_total, dtype=int)
+            # count how many samples landed on each chosen edge so we can assign length share
+            uniq, cnts = np.unique(chosen_edges_total, return_counts=True)
+            cnt_map = {int(u): int(c) for u,c in zip(uniq, cnts)}
+            # for each selected edge occurrence, append meta:
+            for e_id in chosen_edges_total:
+                L_share = float(L[e_id]) / max(cnt_map[e_id], 1)
+                kinds.append(1)
+                # facet fields not used
+                facet_normals.append(np.zeros(3))
+                facet_area_shares.append(0.0)
+                facet_rough.append(0.0)
+                # edge fields
+                edge_len_shares.append(L_share)
+                wedge_alphas.append(float(e_dih[e_id]))
+                # corner fields not used
+                corner_sizes_a.append(0.0)
+                corner_bisectors.append(np.zeros(3))
 
-    # ---------- CORNERS ----------
+    # ---------- CORNERS + metadata ----------
     corner_pts = np.empty((0,3))
     if len(corners)>0 and n_corner>0:
         chosen = np.random.choice(corners, size=n_corner, replace=True)
@@ -432,29 +500,82 @@ def generate_scatterers_from_model(
         if corner_spread>0:
             corner_pts = corner_pts + np.random.randn(n_corner,3)*(corner_spread)
 
+        # metadata for corners
+        for v_idx in chosen:
+            a_size = estimate_corner_size(int(v_idx), verts, e_map)
+            b_vec  = estimate_bisector_from_faces(vert_faces[int(v_idx)], normals)
+            kinds.append(2)
+            # facet fields not used
+            facet_normals.append(np.zeros(3))
+            facet_area_shares.append(0.0)
+            facet_rough.append(0.0)
+            # edge fields not used
+            edge_len_shares.append(0.0)
+            wedge_alphas.append(0.0)
+            # corner fields
+            corner_sizes_a.append(float(a_size))
+            corner_bisectors.append(b_vec)
+
     # ---------- Merge & finalize ----------
     pts = np.vstack([surf_pts, edge_pts, corner_pts])
     if pts.shape[0] > num_centers:
         pts = pts[:num_centers]
-    elif pts.shape[0] < num_centers:
+        # trim metadata to match
+        keep = pts.shape[0]
+        kinds            = kinds[:keep]
+        facet_normals    = facet_normals[:keep]
+        facet_area_shares= facet_area_shares[:keep]
+        facet_rough      = facet_rough[:keep]
+        edge_len_shares  = edge_len_shares[:keep]
+        wedge_alphas     = wedge_alphas[:keep]
+        corner_sizes_a   = corner_sizes_a[:keep]
+        corner_bisectors = corner_bisectors[:keep]
+    elif pts.shape[0] < num_centers and pts.shape[0] > 0:
         need = num_centers - pts.shape[0]
-        add = pts[np.random.choice(pts.shape[0], size=need)] + np.random.randn(need,3)*(1e-4)
-        pts = np.vstack([pts, add])
+        idx = np.random.choice(pts.shape[0], size=need)
+        pts = np.vstack([pts, pts[idx] + np.random.randn(need,3)*(1e-4)])
+        # duplicate corresponding metadata
+        kinds           += [kinds[i] for i in idx]
+        facet_normals   += [facet_normals[i] for i in idx]
+        facet_area_shares += [facet_area_shares[i] for i in idx]
+        facet_rough     += [facet_rough[i] for i in idx]
+        edge_len_shares += [edge_len_shares[i] for i in idx]
+        wedge_alphas    += [wedge_alphas[i] for i in idx]
+        corner_sizes_a  += [corner_sizes_a[i] for i in idx]
+        corner_bisectors+= [corner_bisectors[i] for i in idx]
 
-    # tiny numerical jitter (won't change dimensions meaningfully)
-    pts = pts + (np.random.randn(*pts.shape) * 1e-6)
+    # tiny numerical jitter
+    if pts.shape[0] > 0:
+        pts = pts + (np.random.randn(*pts.shape) * 1e-6)
 
-    amps = np.ones(pts.shape[0])  # “paint dots”; simulator handles physics later
+    amps = np.ones(pts.shape[0])  # simulator handles physics later
 
     N = pts.shape[0]
     positions = jnp.array(pts.T)
-    return TargetParams(
+
+    target = TargetParams(
         positions_m=positions,
         velocities_mps=jnp.zeros((3, N)),
         accelerations_mps2=jnp.zeros((3, N)),
         rcs_dbsm=jnp.array(amps),
         phase_rad=None
     )
+
+    # ---- Pack metadata to JAX arrays ----
+    meta = ScattererMeta(
+        kind=jnp.asarray(np.array(kinds), jnp.int32),
+        face_normal=jnp.asarray(np.array(facet_normals), jnp.float32),
+        area_share=jnp.asarray(np.array(facet_area_shares), jnp.float32),
+        roughness=jnp.asarray(np.array(facet_rough), jnp.float32),
+        edge_len_share=jnp.asarray(np.array(edge_len_shares), jnp.float32),
+        wedge_alpha=jnp.asarray(np.array(wedge_alphas), jnp.float32),
+        corner_size_a=jnp.asarray(np.array(corner_sizes_a), jnp.float32),
+        corner_bisector=jnp.asarray(np.array(corner_bisectors), jnp.float32),
+    )
+
+    return target, bvh, meta
+
+
 
 
 def plot_scatterers_3d(
