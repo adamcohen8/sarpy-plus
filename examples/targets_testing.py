@@ -5,16 +5,17 @@ from sarpy_plus import (RadarParams,
                         plot_time_2d,
                         plot_space_2d,
                         rda,
-                        wka)
-
+                        wka,
+                        SAR_Sim_streaming)
+import time
 # Generate from model
 
 target, bvh, meta = generate_scatterers_from_model(
     "Cybertruck.obj",
-    num_centers=256,
+    num_centers=1024,
     orient="auto",               # ← auto-detect up = Z, length = Y
     subdivide_levels=3,
-    edge_fraction=0.50,
+    edge_fraction=0.40,
     corner_fraction=0.10,
     min_per_face=3,
     surface_edge_hug_frac=0.55,
@@ -47,10 +48,13 @@ radar = RadarParams(
     noise=False
 )
 
+tic = time.time()
+ph = SAR_Sim_streaming(radar, target, bvh=bvh, meta=meta)
+toc = time.time()
+print(toc - tic)
 
-ph = SAR_Sim(radar, target, bvh=bvh, meta=meta)
 
-plot_time_2d(ph, radar)
+# plot_time_2d(ph, radar)
 
 image = rda(ph, radar)
 
