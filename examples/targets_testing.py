@@ -8,16 +8,17 @@ from sarpy_plus import (RadarParams,
                         wka,
                         SAR_Sim_streaming)
 import time
+from jax import jit
 # Generate from model
 
 target, bvh, meta = generate_scatterers_from_model(
-    "Cybertruck.obj",
-    num_centers=1024,
+    "/Users/adamcohen/Downloads/lowell-lunar-crater-from-moontrekjplnasagov/source/trekOBJ/Moon_Crater.obj",
+    num_centers=2048,
     orient="auto",               # ← auto-detect up = Z, length = Y
-    subdivide_levels=3,
+    subdivide_levels=0,
     edge_fraction=0.40,
     corner_fraction=0.10,
-    min_per_face=3,
+    min_per_face=5,
     surface_edge_hug_frac=0.55,
     hard_edge_threshold_deg=6.0,
     silhouette_boost_frac=0.45,
@@ -39,9 +40,9 @@ radar = RadarParams(
     cross_range_resolution_m=0.1,
     pulse_width_sec=0.25e-6,
     prf_hz=3000.0,
-    range_oversample=2.0,
+    range_oversample=1.4,
     ground_range_swath_m=100.0,
-    range_grp_m=500.0,
+    range_grp_m=3000.0,
     azimuth_aperture_factor=1.0,
     SNR_SAR=50.0,
     antenna_pattern="spotlight",
@@ -49,6 +50,7 @@ radar = RadarParams(
 )
 
 tic = time.time()
+SAR_Sim_streaming_jit = jit(SAR_Sim_streaming)
 ph = SAR_Sim_streaming(radar, target, bvh=bvh, meta=meta)
 toc = time.time()
 print(toc - tic)

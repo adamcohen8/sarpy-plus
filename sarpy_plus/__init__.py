@@ -97,5 +97,5 @@ __all__ = [
     "ScattererMeta",
     "RCSParams",
     "compute_rcs_weights",
-    "SAR_Sim_streaming"
+    "SAR_Sim_streaming",
 ]
