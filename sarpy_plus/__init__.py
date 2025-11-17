@@ -4,7 +4,13 @@ from .params import (RadarParams,
                      compute_rcs_weights,
                      RCSParams,
                      ScattererMeta)
-from .sim import SAR_Sim, SAR_Sim_streaming
+from .sim import (SAR_Sim,
+                  SAR_Sim_streaming,
+                  visible_mask_jax,
+                  occluded_segment_jax,
+                  aabb_hit_jax,
+                  ray_triangles_any_hit_jax,
+                  bvh_to_jax)
 from .sar_processing import (crop_ph,
                              pulse_compression,
                              remove_dc,
@@ -98,4 +104,9 @@ __all__ = [
     "RCSParams",
     "compute_rcs_weights",
     "SAR_Sim_streaming",
+    "visible_mask_jax",
+    "occluded_segment_jax",
+    "aabb_hit_jax",
+    "ray_triangles_any_hit_jax",
+    "bvh_to_jax"
 ]

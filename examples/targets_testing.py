@@ -6,16 +6,17 @@ from sarpy_plus import (RadarParams,
                         plot_space_2d,
                         rda,
                         wka,
-                        SAR_Sim_streaming)
+                        SAR_Sim_streaming,
+                        bvh_to_jax)
 import time
 from jax import jit
 # Generate from model
 
 target, bvh, meta = generate_scatterers_from_model(
-    "/Users/adamcohen/Downloads/lowell-lunar-crater-from-moontrekjplnasagov/source/trekOBJ/Moon_Crater.obj",
-    num_centers=2048,
+    "Cybertruck.obj",
+    num_centers=256,
     orient="auto",               # ← auto-detect up = Z, length = Y
-    subdivide_levels=0,
+    subdivide_levels=2,
     edge_fraction=0.40,
     corner_fraction=0.10,
     min_per_face=5,
@@ -29,6 +30,7 @@ target, bvh, meta = generate_scatterers_from_model(
     random_seed=17
 )
 
+jax_bvh = bvh_to_jax(bvh)
 
 plot_scatterers_3d(target)
 
@@ -42,7 +44,7 @@ radar = RadarParams(
     prf_hz=3000.0,
     range_oversample=1.4,
     ground_range_swath_m=100.0,
-    range_grp_m=3000.0,
+    range_grp_m=500.0,
     azimuth_aperture_factor=1.0,
     SNR_SAR=50.0,
     antenna_pattern="spotlight",
@@ -50,8 +52,15 @@ radar = RadarParams(
 )
 
 tic = time.time()
-SAR_Sim_streaming_jit = jit(SAR_Sim_streaming)
-ph = SAR_Sim_streaming(radar, target, bvh=bvh, meta=meta)
+import jax
+
+SAR_Sim_streaming_jit = jax.jit(
+    SAR_Sim_streaming,
+    static_argnames=("radar",)
+)
+
+ph = SAR_Sim_streaming_jit(radar, target, jax_bvh=jax_bvh, meta=meta)
+ph.block_until_ready()
 toc = time.time()
 print(toc - tic)
 
@@ -61,4 +70,4 @@ print(toc - tic)
 image = rda(ph, radar)
 
 plot_space_2d(image, radar, window=8)
-plot_space_2d(image, radar, window=8, db=True)
+plot_space_2d(image, radar, db=True, window=8)

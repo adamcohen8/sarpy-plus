@@ -8,6 +8,12 @@ from sarpy_plus.params import (RadarParams,
 from sarpy_plus.constants import  c, k
 from dataclasses import dataclass
 import numpy as np
+from jax import lax, vmap, jit
+from jax.tree_util import register_pytree_node_class
+# ----------------------------
+# JAX BVH container + converter
+# ----------------------------
+
 
 
 def ray_triangle_mt(orig: np.ndarray, dir: np.ndarray,
@@ -37,6 +43,7 @@ def ray_triangle_mt(orig: np.ndarray, dir: np.ndarray,
         return False
     return True
 
+
 @dataclass
 class BVHNode:
     bbox_min: np.ndarray
@@ -45,6 +52,7 @@ class BVHNode:
     right: int
     start: int
     count: int
+
 
 class BVH:
     """
@@ -178,10 +186,347 @@ class BVH:
         return vis
 
 
+@register_pytree_node_class
+@dataclass
+class JaxBVH:
+    bbox_min: jnp.ndarray   # (Nnodes, 3)
+    bbox_max: jnp.ndarray   # (Nnodes, 3)
+    left:     jnp.ndarray   # (Nnodes,)
+    right:    jnp.ndarray   # (Nnodes,)
+    start:    jnp.ndarray   # (Nnodes,)
+    count:    jnp.ndarray   # (Nnodes,)
+    tri_v0:   jnp.ndarray   # (F,3)
+    tri_v1:   jnp.ndarray   # (F,3)
+    tri_v2:   jnp.ndarray   # (F,3)
+    index:    jnp.ndarray   # (F,)
+    leaf_size: int          # scalar Python int
+    n_nodes:  int           # scalar Python int
+
+    # ---------- Pytree interface ----------
+
+    def tree_flatten(self):
+        """
+        Tell JAX how to view this object as a pytree:
+        - children: all array fields (traced as usual)
+        - aux_data: small Python metadata (kept static)
+        """
+        children = (
+            self.bbox_min,
+            self.bbox_max,
+            self.left,
+            self.right,
+            self.start,
+            self.count,
+            self.tri_v0,
+            self.tri_v1,
+            self.tri_v2,
+            self.index,
+        )
+        aux_data = (self.leaf_size, self.n_nodes)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        """
+        Rebuild JaxBVH from children + aux_data.
+        """
+        leaf_size, n_nodes = aux_data
+        (
+            bbox_min,
+            bbox_max,
+            left,
+            right,
+            start,
+            count,
+            tri_v0,
+            tri_v1,
+            tri_v2,
+            index,
+        ) = children
+
+        return cls(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            left=left,
+            right=right,
+            start=start,
+            count=count,
+            tri_v0=tri_v0,
+            tri_v1=tri_v1,
+            tri_v2=tri_v2,
+            index=index,
+            leaf_size=leaf_size,
+            n_nodes=n_nodes,
+        )
+
+def bvh_to_jax(bvh: BVH) -> JaxBVH:
+    """
+    Convert your numpy/Python BVH into a flat JAX-friendly structure.
+    Call this once after building BVH.
+    """
+    nodes = bvh.nodes
+    Nnodes = len(nodes)
+
+    bbox_min = np.stack([n.bbox_min for n in nodes], axis=0)  # (Nnodes,3)
+    bbox_max = np.stack([n.bbox_max for n in nodes], axis=0)
+    left     = np.array([n.left  for n in nodes], dtype=np.int32)
+    right    = np.array([n.right for n in nodes], dtype=np.int32)
+    start    = np.array([n.start for n in nodes], dtype=np.int32)
+    count    = np.array([n.count for n in nodes], dtype=np.int32)
+
+    return JaxBVH(
+        bbox_min=jnp.array(bbox_min),
+        bbox_max=jnp.array(bbox_max),
+        left=jnp.array(left),
+        right=jnp.array(right),
+        start=jnp.array(start),
+        count=jnp.array(count),
+        tri_v0=jnp.array(bvh.tri_v0),
+        tri_v1=jnp.array(bvh.tri_v1),
+        tri_v2=jnp.array(bvh.tri_v2),
+        index=jnp.array(bvh.index),
+        leaf_size=int(bvh.leaf_size),
+        n_nodes=Nnodes,
+    )
+
+
+def ray_triangles_any_hit_jax(
+    orig: jnp.ndarray,     # (3,)
+    direction: jnp.ndarray,# (3,) unit
+    v0: jnp.ndarray,       # (M,3)
+    v1: jnp.ndarray,       # (M,3)
+    v2: jnp.ndarray,       # (M,3)
+    tmax: float,
+    eps: float,
+    mask: jnp.ndarray,     # (M,) bool: True = valid triangle, False = padding
+) -> jnp.bool_:
+    """
+    Vectorized Möller–Trumbore over a small batch of triangles.
+    Returns True if any *valid* triangle is hit strictly before tmax.
+    """
+    e1 = v1 - v0            # (M,3)
+    e2 = v2 - v0            # (M,3)
+
+    # pvec = d x e2
+    pvec = jnp.cross(direction[None, :], e2)       # (M,3)
+    det  = jnp.einsum('ij,ij->i', e1, pvec)       # (M,)
+
+    # parallel triangles → no hit
+    det_abs = jnp.abs(det)
+    EPS_DET = eps
+    no_parallel = det_abs >= EPS_DET
+
+    inv_det = jnp.where(no_parallel, 1.0 / det, 0.0)
+
+    tvec = orig[None, :] - v0                     # (M,3)
+    u = jnp.einsum('ij,ij->i', tvec, pvec) * inv_det
+
+    valid_u = (u >= 0.0) & (u <= 1.0) & no_parallel
+
+    qvec = jnp.cross(tvec, e1)                    # (M,3)
+    v = jnp.einsum('ij,ij->i', direction[None, :], qvec) * inv_det
+
+    valid_v = (v >= 0.0) & ((u + v) <= 1.0) & valid_u
+
+    t = jnp.einsum('ij,ij->i', e2, qvec) * inv_det
+
+    valid_t = (t > eps) & (t < (tmax - eps)) & valid_v
+
+    # apply mask so padded triangles are ignored
+    final_hit = valid_t & mask
+
+    return jnp.any(final_hit)
+
+
+
+def aabb_hit_jax(
+    orig: jnp.ndarray,     # (3,)
+    inv_dir: jnp.ndarray,  # (3,)
+    bmin: jnp.ndarray,     # (3,)
+    bmax: jnp.ndarray,     # (3,)
+    tmax: float,
+) -> jnp.bool_:
+    """
+    Slab-based AABB-ray intersection.
+    Returns a single boolean: does the ray hit the box within (0, tmax)?
+    """
+    # param ranges along each axis
+    t1 = (bmin - orig) * inv_dir  # (3,)
+    t2 = (bmax - orig) * inv_dir  # (3,)
+
+    tmin = jnp.minimum(t1, t2)    # (3,)
+    tmax_arr = jnp.maximum(t1, t2)# (3,)
+
+    t_near = jnp.max(tmin)
+    t_far  = jnp.min(tmax_arr)
+
+    return (t_near < t_far) & (t_near < tmax) & (t_far > 0.0)
+
+
+
+def occluded_segment_jax(
+    orig: jnp.ndarray,     # (3,)
+    end: jnp.ndarray,      # (3,)
+    jax_bvh: JaxBVH,
+    eps: float = 1e-9,
+) -> jnp.bool_:
+    """
+    True if any triangle intersects the open segment (orig, end), using JAX BVH.
+    """
+
+    dir_vec = end - orig
+    tmax = jnp.linalg.norm(dir_vec)
+
+    def degenerate(_):
+        return jnp.bool_(False)
+
+    def nondegenerate(_):
+        direction = dir_vec / tmax
+
+        # inv_dir with epsilon
+        inv_dir = 1.0 / jnp.where(
+            jnp.abs(direction) < eps,
+            jnp.sign(direction) * eps,
+            direction,
+        )
+
+        # stack: holds node indices; initialize with root (0)
+        n_nodes = jax_bvh.n_nodes
+        stack_init = -jnp.ones((n_nodes,), dtype=jnp.int32)
+        stack_init = stack_init.at[0].set(0)
+        sp_init = jnp.int32(1)      # stack pointer
+        hit_init = jnp.bool_(False)
+
+        def cond_fun(carry):
+            sp, hit, stack = carry
+            return (sp > 0) & (~hit)
+
+        def body_fun(carry):
+            sp, hit, stack = carry
+            sp = sp - 1
+            nid = stack[sp]
+
+            # Fetch node box
+            bmin = jax_bvh.bbox_min[nid]
+            bmax = jax_bvh.bbox_max[nid]
+
+            box_hit = aabb_hit_jax(orig, inv_dir, bmin, bmax, tmax)
+
+            def no_box_hit(_):
+                return (sp, hit, stack)
+
+            def box_hit_branch(_):
+                count = jax_bvh.count[nid]
+                is_leaf = count <= jax_bvh.leaf_size
+
+                def handle_leaf(_):
+                    start = jax_bvh.start[nid]
+                    leaf_size = jax_bvh.leaf_size
+
+                    # *** dynamic slice instead of start:start+leaf_size ***
+                    tri_ids = lax.dynamic_slice(
+                        jax_bvh.index,
+                        (start,),
+                        (leaf_size,),
+                    )  # (leaf_size,)
+
+                    v0 = jax_bvh.tri_v0[tri_ids]
+                    v1 = jax_bvh.tri_v1[tri_ids]
+                    v2 = jax_bvh.tri_v2[tri_ids]
+
+                    valid_mask = jnp.arange(leaf_size) < count  # (leaf_size,)
+
+                    tri_hit = ray_triangles_any_hit_jax(
+                        orig,
+                        direction,
+                        v0,
+                        v1,
+                        v2,
+                        tmax,
+                        eps,
+                        valid_mask,
+                    )
+
+                    return (sp, hit | tri_hit, stack)
+
+                def handle_inner(_):
+                    left = jax_bvh.left[nid]
+                    right = jax_bvh.right[nid]
+
+                    stack1 = stack.at[sp].set(left)
+                    stack2 = stack1.at[sp + 1].set(right)
+                    sp2 = sp + 2
+                    return (sp2, hit, stack2)
+
+                return lax.cond(
+                    is_leaf,
+                    handle_leaf,
+                    handle_inner,
+                    operand=None,
+                )
+
+            return lax.cond(
+                box_hit,
+                box_hit_branch,
+                no_box_hit,
+                operand=None,
+            )
+
+        sp_final, hit_final, stack_final = lax.while_loop(
+            cond_fun,
+            body_fun,
+            (sp_init, hit_init, stack_init),
+        )
+        return hit_final
+
+    return lax.cond(tmax <= eps, degenerate, nondegenerate, operand=None)
 
 
 
 
+def visible_mask_jax(
+    sensor_o: jnp.ndarray,   # (3,)
+    pt: jnp.ndarray,         # (3,)
+    jax_bvh: JaxBVH,
+    eps_pullback: float,
+    eps_ray: float,
+) -> jnp.float32:
+    """
+    Return 1.0 if visible, 0.0 if occluded, using JAX BVH.
+    Equivalent logic to BVH.visible_mask_segment for a single point.
+    """
+    d = pt - sensor_o
+    L = jnp.linalg.norm(d)
+
+    def degenerate(_):
+        # you can pick True or False here; L <= eps usually never happens
+        return jnp.float32(0.0)
+
+    def normal(_):
+        p_back = pt - (eps_pullback * d / L)
+        hit = occluded_segment_jax(sensor_o, p_back, jax_bvh, eps=eps_ray)
+        # visible = not occluded
+        return jnp.float32(jnp.logical_not(hit))
+
+    return lax.cond(L <= eps_ray, degenerate, normal, operand=None)
+
+
+
+def visible_mask_points_jax(
+    sensor_o: jnp.ndarray,   # (3,)
+    pts: jnp.ndarray,        # (N,3)
+    jax_bvh: JaxBVH,
+    eps_pullback: float,
+    eps_ray: float,
+) -> jnp.ndarray:
+    """
+    Vectorized visibility: returns (N,) float32 mask in {0.0, 1.0}.
+    """
+    vm = jax.vmap(
+        lambda pt: visible_mask_jax(sensor_o, pt, jax_bvh, eps_pullback, eps_ray),
+        in_axes=0,
+    )
+    return vm(pts)  # (N,)
 
 
 def SAR_Sim(
@@ -384,227 +729,222 @@ def SAR_Sim(
 
 
 
-
-
 def SAR_Sim_streaming(
     radar: RadarParams,
     tgt: TargetParams,
+    jax_bvh: JaxBVH | None = None,
+    meta: ScattererMeta | None = None,
+    rcs_params: RCSParams | None = None,
     key: jax.random.PRNGKey = jax.random.PRNGKey(0),
-    *,
-    bvh=None,                               # BVH instance or None
-    meta: ScattererMeta | None = None,      # per-scatterer metadata for RCS model
-    rcs_params: RCSParams | None = None,    # optional RCS tuning params
-    vis_eps_pullback_frac: float = 1e-4,    # for BVH visibility
-    vis_eps_ray_frac: float = 1e-6
 ) -> jnp.ndarray:
     """
-    Streaming SAR simulator: processes one pulse at a time to avoid
-    allocating (Nr x Ntgt x Np) arrays.
+    Streaming SAR raw phase-history simulator (complex voltage).
+    Memory-light version: loops over pulses, never forms (Nr, Ntgt, Np) tensors.
 
-    Behavior:
-      - If bvh is None:
-            * No occlusion culling
-            * Uses tgt.rcs_dbsm (old RCS behavior)
-      - If bvh is not None and meta is None:
-            * Applies BVH-based self-occlusion per pulse
-            * RCS still from tgt.rcs_dbsm
-      - If bvh is not None and meta is not None:
-            * Applies BVH-based self-occlusion per pulse
-            * Uses compute_rcs_weights(...) for σ_lin per scatterer & pulse
+    - Uses JAX throughout (no numpy conversions), so it can be jitted.
+    - If `jax_bvh` is provided, performs per-pulse visibility masking via BVH.
+    - If `meta` and `rcs_params` are provided, uses geometric RCS model.
+      Otherwise falls back to tgt.rcs_dbsm.
+
+    Returns:
+        ph: (Nr, Np) complex64 phase history.
     """
-
     # ---------- Pre-compute constants ----------
     fs      = radar.sample_rate_hz
     lam     = radar.center_wavelength_m
     four_pi = 4.0 * jnp.pi
-    lam_fac = lam / (four_pi ** 1.5)       #  λ / (4π)^{3/2}
-    t_fast  = radar.t_fast                 # (Nr,)
-    t_slow  = radar.t_slow                 # (Np,)
-    Nr      = t_fast.size
+    lam_fac = lam / (four_pi ** 1.5)        # λ / (4π)^{3/2}
+    t_fast  = radar.t_fast                  # (Nr,)
+    t_slow  = radar.t_slow                  # (Np,)
+    Nrg     = t_fast.size
     Np      = t_slow.size
 
-    # Target count
-    Ntgt    = tgt.rcs_dbsm.size
-
-    # Static per-target phase
-    phase0  = (tgt.phase_rad
-               if tgt.phase_rad is not None else jnp.zeros_like(tgt.rcs_dbsm))
-
-    # ---------- Platform state (all pulses) ----------
+    # ---------- Platform state  (same as original SAR_Sim) ----------
     grazing = jnp.arcsin(radar.platform_altitude_m / radar.range_grp_m)
-    mid_pos = jnp.array([
-        -radar.range_grp_m * jnp.cos(grazing),
-        0.0,
-        radar.platform_altitude_m
-    ])
+    mid_pos = jnp.array(
+        [
+            -radar.range_grp_m * jnp.cos(grazing),
+            0.0,
+            radar.platform_altitude_m,
+        ]
+    )
 
+    # sar_pos: (3, Np)
     sar_pos = jnp.stack(
-        (jnp.full(Np, mid_pos[0]),
-         t_slow * radar.platform_speed_mps,
-         jnp.full(Np, mid_pos[2])), axis=0
-    )  # (3, Np)
+        (
+            jnp.full((Np,), mid_pos[0]),
+            t_slow * radar.platform_speed_mps,
+            jnp.full((Np,), mid_pos[2]),
+        ),
+        axis=0,
+    )
 
-    # For RCS model (if used)
-    if (bvh is not None) and (meta is not None):
-        if rcs_params is None:
-            rcs_params = RCSParams()
-        fc_hz = float(c / lam)
-        pol = getattr(radar, "polarization", "HH")
-
-    # ---------- Antenna beam parameters ----------
-    beam_dir = jnp.array([jnp.cos(grazing), 0., -jnp.sin(grazing)])
-    beam_dir_norm = jnp.linalg.norm(beam_dir)
+    # beam direction and pattern constants
+    beam_dir = jnp.array([jnp.cos(grazing), 0.0, -jnp.sin(grazing)])
     theta_3dB = radar.beamwidth_rad / 2.0
 
-    # ---------- Amplitude constant (Tx/Rx gains, power) ----------
+    # ---------- Target / phase init ----------
+    Ntgt   = tgt.rcs_dbsm.size
+    phase0 = (
+        tgt.phase_rad
+        if tgt.phase_rad is not None
+        else jnp.zeros_like(tgt.rcs_dbsm)
+    )  # (Ntgt,)
+
+    # Base RCS from tgt.rcs_dbsm (used if no geometric model)
+    sigma_v_base = jnp.sqrt(10.0 ** (tgt.rcs_dbsm / 10.0))  # (Ntgt,)
+
+    # ---------- Optional geometric RCS model (precompute across all pulses) ----------
+    # We treat it as additional σ(geom, pulse); amplitude ~ sqrt(σ_geom)
+    use_geom_rcs = (meta is not None) and (rcs_params is not None)
+
+    if use_geom_rcs:
+        # sensor positions for all pulses: (Np,3)
+        sensor_pos_all = sar_pos.T  # (Np,3)
+        # σ_geom: (S, Np) = (Ntgt, Np)
+        sigma_geom = compute_rcs_weights(
+            positions_m=tgt.positions_m,
+            sensor_pos_m=sensor_pos_all,
+            fc_hz=radar.center_frequency_hz,
+            meta=meta,
+            params=rcs_params,
+            pol="HH",
+        )  # (Ntgt, Np)
+    else:
+        sigma_geom = None
+
+    # ---------- Voltage-range constant (common to all pulses) ----------
     Gt_lin  = 10.0 ** (radar.transmit_gain_db / 10.0)
     Gr_lin  = 10.0 ** (radar.receive_gain_db / 10.0)
 
-    A0 = (jnp.sqrt(radar.transmit_power_watts * Gt_lin * Gr_lin) *
-          lam_fac)                                            # scalar
+    A0 = jnp.sqrt(radar.transmit_power_watts * Gt_lin * Gr_lin) * lam_fac  # scalar
 
-    # ---------- Dechirp / fast-time terms that don't depend on pulse ----------
-    if radar.demodulation == 'Dechirp':
-        tau_ref = 2.0 * radar.range_grp_m / c
-        mask_fast = jnp.abs(t_fast - tau_ref) < radar.pulse_width_sec / 2.0  # (Nr,)
-        tcen_ref = t_fast - tau_ref
-        dechirp_phase_fast = -jnp.pi * radar.chirp_rate_hz_per_sec * tcen_ref ** 2  # (Nr,)
-    else:
-        mask_fast = None
-        dechirp_phase_fast = 0.0
-
-    # ---------- kTB noise constants (per sample) ----------
+    # ---------- Noise constants ----------
     Tsys  = radar.system_temperature_K
     F_lin = 10.0 ** (radar.noise_figure_db / 10.0)
-    N0    = k * Tsys * F_lin              # W / Hz
-    Pn    = N0 * fs                       # total noise power in bandwidth
-    noise_std = jnp.sqrt(Pn / 2.0)        # per real/imag component
+    N0    = k * Tsys * F_lin             # W / Hz
+    Pn    = N0 * fs                      # total noise power in bandwidth
+    noise_std = jnp.sqrt(Pn / 2.0)       # per real component
 
-    # ---------- Visibility epsilons (BVH) ----------
-    if bvh is not None:
-        # Scene extent from initial positions
-        pts0_np = np.asarray(np.array(tgt.positions_m.T))  # (Ntgt,3)
-        scene_extent = float(np.max(np.ptp(pts0_np, axis=0))) if pts0_np.size > 0 else 1.0
-        eps_pull = max(vis_eps_pullback_frac * scene_extent, 1e-9)
-        eps_ray  = max(vis_eps_ray_frac       * scene_extent, 1e-9)
-    else:
-        eps_pull = eps_ray = None
+    # ---------- Allocate output ----------
+    ph0 = jnp.zeros((Nrg, Np), dtype=jnp.complex64)
 
-    # ---------- Streaming over pulses ----------
-    ph_cols = []  # will collect (Nr,) per pulse
+    # ---------- Per-pulse loop body (fori_loop) ----------
+    def body_fun(p: int, ph: jnp.ndarray) -> jnp.ndarray:
+        # Scalar slow-time and sensor position for pulse p
+        t_p = t_slow[p]
+        s_p = sar_pos[:, p]          # (3,)
 
-    # Pre-extract JAX arrays we reuse
-    pos0 = tgt.positions_m          # (3,Ntgt)
-    vel0 = tgt.velocities_mps       # (3,Ntgt)
-    acc0 = tgt.accelerations_mps2   # (3,Ntgt)
+        # Target instantaneous positions for this pulse: r0_p (3, Ntgt)
+        r0_p = (
+            tgt.positions_m
+            + tgt.velocities_mps * t_p
+            + 0.5 * tgt.accelerations_mps2 * t_p * t_p
+        )  # (3,Ntgt)
 
-    for p in range(Np):
-        t_p = t_slow[p]             # scalar
-        s_p = sar_pos[:, p]         # (3,)
+        # Relative vectors and ranges: rel_p (3,Ntgt), R_p (Ntgt,)
+        rel_p = r0_p - s_p[:, None]
+        R_p = jnp.linalg.norm(rel_p, axis=0)  # (Ntgt,)
 
-        # ----- Target positions & ranges for this pulse -----
-        r0_p = pos0 + vel0 * t_p + 0.5 * acc0 * t_p**2   # (3,Ntgt)
-        rel_p = r0_p - s_p[:, None]                      # (3,Ntgt)
-        R_p   = jnp.linalg.norm(rel_p, axis=0)           # (Ntgt,)
-
-        # ----- Antenna pattern (per target) -----
-        cosang = jnp.einsum("ij,i->j", rel_p, beam_dir) / (R_p * beam_dir_norm)
-        cosang = jnp.clip(cosang, -1.0, 1.0)
-        theta_p = jnp.arccos(cosang)                     # (Ntgt,)
+        # ---------- Antenna pattern for this pulse ----------
+        # angle between rel_p and beam_dir
+        # cosθ = (rel_p · beam_dir) / (|rel_p| * |beam_dir|)
+        bd_norm = jnp.linalg.norm(beam_dir)
+        cos_theta = jnp.einsum("ij,j->i", rel_p.T, beam_dir) / (R_p * bd_norm)
+        cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
+        theta = jnp.arccos(cos_theta)  # (Ntgt,)
 
         if radar.antenna_pattern == "binary":
-            G_beam_v_p = (theta_p <= theta_3dB).astype(jnp.float32)
+            G_beam_v = (theta <= theta_3dB).astype(jnp.float32)
         elif radar.antenna_pattern == "parabolic":
-            u = jnp.pi * theta_p / theta_3dB
+            u = jnp.pi * theta / theta_3dB
             pattern = jnp.where(
-                u < 1e-6, 1.0,
-                3 * (jnp.sin(u) - u * jnp.cos(u)) / u ** 3
+                u < 1e-6,
+                1.0,
+                3.0 * (jnp.sin(u) - u * jnp.cos(u)) / (u**3),
             )
-            G_beam_v_p = jnp.abs(pattern)
+            G_beam_v = jnp.abs(pattern)
         elif radar.antenna_pattern == "gaussian":
-            G_beam_v_p = jnp.exp(- (jnp.log(2) / 2) * (theta_p / theta_3dB) ** 2)
+            G_beam_v = jnp.exp(
+                - (jnp.log(2.0) / 2.0) * (theta / theta_3dB) ** 2
+            )
         elif radar.antenna_pattern == "sinc":
-            G_beam_v_p = jnp.sqrt((jnp.sinc(theta_p / theta_3dB)) ** 2)
-        else:  # spotlight / no pattern
-            G_beam_v_p = jnp.ones_like(theta_p)
+            G_beam_v = jnp.sqrt(jnp.sinc(theta / theta_3dB) ** 2)
+        else:  # "spotlight" / default
+            G_beam_v = jnp.ones_like(theta)
 
-        # ----- Visibility mask via BVH (if any) -----
-        if bvh is not None:
-            # Convert current target positions to numpy for BVH
-            pts_p_np = np.asarray(np.array(r0_p.T))      # (Ntgt,3)
-            s_p_np   = np.asarray(np.array(s_p))         # (3,)
-            vis_np   = bvh.visible_mask_segment(s_p_np, pts_p_np,
-                                                eps_pull, eps_ray)  # (Ntgt,) bool
-            vis_mask_p = jnp.asarray(vis_np, dtype=jnp.float32)     # (Ntgt,)
+        # ---------- Visibility mask via JAX BVH (if provided) ----------
+        if jax_bvh is not None:
+            # r0_p.T: (Ntgt,3)
+            vis_mask = visible_mask_points_jax(
+                s_p,  # sensor_o (3,)
+                r0_p.T,  # pts (Ntgt,3)
+                jax_bvh,
+                1e-3,  # eps_pullback
+                1e-6,  # eps_ray
+            )  # (Ntgt,) float32 in {0,1}
+            vis_mask_v = vis_mask.astype(jnp.float32)
         else:
-            vis_mask_p = jnp.ones((Ntgt,), dtype=jnp.float32)
+            vis_mask_v = jnp.ones((Ntgt,), dtype=jnp.float32)
 
-        # ----- RCS: either new model or legacy tgt.rcs_dbsm -----
-        if (bvh is not None) and (meta is not None):
-            # New model: per-pulse RCS (σ_lin → voltage)
-            sensor_pos_m = s_p[None, :]   # (1,3)
-            sigma_lin_p = compute_rcs_weights(
-                positions_m=pos0,                # (3,Ntgt)
-                sensor_pos_m=sensor_pos_m,       # (1,3)
-                fc_hz=fc_hz,
-                meta=meta,
-                params=rcs_params,
-                pol=pol,
-                c=float(c)
-            )  # (Ntgt, 1)
-            sigma_lin_p = sigma_lin_p[:, 0]      # (Ntgt,)
-            sigma_v_p = jnp.sqrt(sigma_lin_p)    # (Ntgt,)
+        # ---------- RCS / amplitude for this pulse ----------
+        if use_geom_rcs:
+            # σ_geom[:,p] is linear RCS(m^2) for each scatterer at pulse p
+            sigma_geom_p = sigma_geom[:, p]             # (Ntgt,)
+            sigma_v_p = jnp.sqrt(sigma_geom_p)          # voltage ~ sqrt(σ)
         else:
-            # Legacy per-target RCS, independent of aspect
-            sigma_v_p = jnp.sqrt(10.0 ** (tgt.rcs_dbsm / 10.0))  # (Ntgt,)
+            sigma_v_p = sigma_v_base                    # (Ntgt,)
 
-        # Apply beam, range loss, visibility
-        A_R_p = (A0 *
-                 sigma_v_p *
-                 G_beam_v_p *
-                 R_p ** (-2) *
-                 vis_mask_p)                      # (Ntgt,)
+        # Total amplitude:
+        A_R_p = A0 * sigma_v_p * G_beam_v * vis_mask_v * (R_p ** -2)  # (Ntgt,)
 
-        # ----- Fast-time & phase -----
-        tau_p  = 2.0 * R_p / c                   # (Ntgt,)
-        tcen_p = t_fast[:, None] - tau_p[None, :]  # (Nr,Ntgt)
+        # ---------- Fast-time envelope / phase ----------
+        tau_p = 2.0 * R_p / c                          # (Ntgt,)
+        # t_fast: (Nr,), tau_p: (Ntgt,)
+        tcen_p = t_fast[:, None] - tau_p[None, :]      # (Nr, Ntgt)
 
-        if radar.demodulation == 'Dechirp':
-            mask_p = jnp.broadcast_to(mask_fast[:, None], tcen_p.shape)   # (Nr,Ntgt)
-            p2_p   = jnp.pi * radar.chirp_rate_hz_per_sec * tcen_p ** 2
-            dechirp_p = dechirp_phase_fast[:, None]                       # (Nr,1)
-        else:
-            mask_p = jnp.abs(tcen_p) < radar.pulse_width_sec / 2.0        # (Nr,Ntgt)
-            p2_p   = jnp.pi * radar.chirp_rate_hz_per_sec * tcen_p ** 2
+        if radar.demodulation == "Dechirp":
+            tau_ref = 2.0 * radar.range_grp_m / c
+            # fixed mask centered on reference; approximation
+            mask_p = (
+                jnp.abs(t_fast[:, None] - tau_ref) < radar.pulse_width_sec / 2.0
+            )  # (Nr,1) broadcast
+            tcen_ref = t_fast - tau_ref                # (Nr,)
+            dechirp_p = -jnp.pi * radar.chirp_rate_hz_per_sec * (tcen_ref**2)
+            dechirp_p = dechirp_p[:, None]             # (Nr,1) for broadcast
+        else:  # 'Quadrature'
+            mask_p = jnp.abs(tcen_p) < radar.pulse_width_sec / 2.0
             dechirp_p = 0.0
 
-        p1_p = -4.0 * jnp.pi * R_p                    # (Ntgt,)
+        # 2-way phase & chirp phase
+        p1 = -4.0 * jnp.pi * R_p / lam                 # (Ntgt,)
+        p2 = jnp.pi * radar.chirp_rate_hz_per_sec * (tcen_p**2)  # (Nr,Ntgt)
+
         total_phase_p = (
-            (p1_p[None, :] / lam) +
-            phase0[None, :] +                         # (1,Ntgt)
-            p2_p +                                    # (Nr,Ntgt)
-            dechirp_p                                 # (Nr,1) or 0
+            p1[None, :] + phase0[None, :] + p2 + dechirp_p
         )  # (Nr,Ntgt)
 
+        # target contribution for this pulse: (Nr,Ntgt)
         target_v_p = (
-            A_R_p[None, :] *
-            jnp.exp(1j * total_phase_p) *
-            mask_p.astype(jnp.float32)
-        )  # (Nr,Ntgt)
+            A_R_p[None, :] * jnp.exp(1j * total_phase_p) * mask_p.astype(jnp.float32)
+        )
 
-        ph_p = jnp.sum(target_v_p, axis=1)   # (Nr,)
+        # sum over targets → range profile for pulse p
+        ph_p = jnp.sum(target_v_p, axis=1)  # (Nr,)
 
-        # ----- Add kTB noise for this pulse -----
+        # write into ph[:,p]
+        ph = ph.at[:, p].set(ph_p.astype(jnp.complex64))
+        return ph
+
+    # JAX for-loop over pulses
+    ph = lax.fori_loop(0, Np, body_fun, ph0)
+
+    # ---------- Add noise (vectorized over whole (Nr,Np)) ----------
+    if radar.noise:
         key, k_r, k_i = jax.random.split(key, 3)
-        if radar.noise:
-            noise_real_p = jax.random.normal(k_r, ph_p.shape) * noise_std
-            noise_imag_p = jax.random.normal(k_i, ph_p.shape) * noise_std
-            ph_p = ph_p + (noise_real_p + 1j * noise_imag_p)
-
-        ph_cols.append(ph_p)
-
-    # Stack columns → (Nr, Np)
-    ph = jnp.stack(ph_cols, axis=1)
+        noise_real = jax.random.normal(k_r, ph.shape) * noise_std
+        noise_imag = jax.random.normal(k_i, ph.shape) * noise_std
+        ph = ph + (noise_real + 1j * noise_imag).astype(jnp.complex64)
 
     return ph
 
